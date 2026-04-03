@@ -13,18 +13,32 @@ export const ImageCard: React.FC<ImageCardProps> = ({ image }) => {
 
   const handleError = () => {
     if (retryStage === 0) {
-      // Stage 1: Try corsproxy.io
-      console.log(`Retry 1 (Proxy) for: ${image.url}`);
-      setRetryStage(1);
-      setImgSrc(`https://corsproxy.io/?url=${encodeURIComponent(image.url)}`);
+      // Stage 1: Try original URL if it exists and is different
+      if (image.originalUrl && image.originalUrl !== image.url) {
+        console.log(`Retry 1 (Original) for: ${image.url}`);
+        setRetryStage(1);
+        setImgSrc(image.originalUrl);
+      } else {
+        // Skip to proxy if no original URL
+        handleRetry(2);
+      }
     } else if (retryStage === 1) {
-      // Stage 2: Try allorigins.win (often works when others fail)
-      console.log(`Retry 2 (AllOrigins) for: ${image.url}`);
-      setRetryStage(2);
-      setImgSrc(`https://api.allorigins.win/raw?url=${encodeURIComponent(image.url)}`);
+      handleRetry(2);
+    } else if (retryStage === 2) {
+      handleRetry(3);
     } else {
-      // Final Failure
       setHasError(true);
+    }
+  };
+
+  const handleRetry = (stage: number) => {
+    setRetryStage(stage);
+    if (stage === 2) {
+      console.log(`Retry 2 (Proxy) for: ${image.url}`);
+      setImgSrc(`https://corsproxy.io/?url=${encodeURIComponent(image.url)}`);
+    } else if (stage === 3) {
+      console.log(`Retry 3 (AllOrigins) for: ${image.url}`);
+      setImgSrc(`https://api.allorigins.win/raw?url=${encodeURIComponent(image.url)}`);
     }
   };
 

@@ -21,9 +21,9 @@ export const analyzeProductHtml = async (html: string, url: string): Promise<Ext
   const ai = new GoogleGenAI({ apiKey });
 
   // HEAVY OPTIMIZATION: Reduce Token Usage to avoid 429 Errors
-  // 1. Remove scripts, styles, SVGs, comments, and base64 data to save tokens
+  // 1. Remove scripts (except JSON-LD), styles, SVGs, comments, and base64 data to save tokens
   let cleanHtml = html
-    .replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, "")
+    .replace(/<script\b(?![^>]*type=["']application\/ld\+json["'])[^>]*>([\s\S]*?)<\/script>/gim, "")
     .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gim, "")
     .replace(/<svg\b[^>]*>([\s\S]*?)<\/svg>/gim, "")
     .replace(/<!--[\s\S]*?-->/g, "")

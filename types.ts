@@ -1,6 +1,7 @@
 
 export interface ExtractedImage {
   url: string;
+  originalUrl?: string; // Fallback if upgraded URL fails
   altText?: string;
   resolution?: string;
   sourceType: 'gallery' | 'hero' | 'thumbnail' | 'variant';

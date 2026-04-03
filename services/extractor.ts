@@ -49,21 +49,29 @@ export const fetchProductPage = async (url: string): Promise<string> => {
 
     const rawProxies = [
       `https://corsproxy.io/?${encodedUrl}`, 
+      `https://api.allorigins.win/raw?url=${encodedUrl}`,
       `https://api.codetabs.com/v1/proxy?quest=${encodedUrl}`,
       `https://thingproxy.freeboard.io/fetch/${targetUrl}`,
-      `https://cors-anywhere.herokuapp.com/${targetUrl}`
+      `https://cors-anywhere.herokuapp.com/${targetUrl}`,
+      `https://proxy.cors.sh/${targetUrl}`
     ];
 
     for (const proxyUrl of rawProxies) {
       try {
+        const proxyName = new URL(proxyUrl).hostname;
+        console.log(`Trying proxy: ${proxyName}`);
         const response = await fetchWithTimeout(proxyUrl);
         if (response.ok) {
           const text = await response.text();
-          if (text && text.length > 500 && !text.includes('Challenge Validation') && !text.includes('Cloudflare')) {
+          if (text && text.length > 500 && !text.includes('Challenge Validation') && !text.includes('Cloudflare') && !text.includes('Access Denied')) {
+               console.log(`Success with proxy: ${proxyName}`);
                return text;
           }
+          console.warn(`Proxy ${proxyName} returned invalid or blocked content (length: ${text?.length})`);
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error(`Proxy failed:`, e);
+      }
     }
     throw new Error("Target website is blocking the request. Try a different URL or check your connection.");
   };
@@ -160,7 +168,15 @@ export const fetchProductPage = async (url: string): Promise<string> => {
           let dummyHtml = '<!-- ELASTRON DUMMY HTML -->\n';
           allProducts.forEach(prod => {
               if (prod.imagem) {
-                  let hqUrl = prod.imagem.replace(/_\d+X\d+_/i, '_');
+                  // Elastron often uses 600X426_600X426_HASH.ext or 400X400_HASH.ext
+                  // We want to strip all size prefixes to get the original high-res image
+                  let hqUrl = prod.imagem.replace(/(\d+X\d+_)+/gi, '');
+                  
+                  // If it's a relative path, make it absolute
+                  if (hqUrl.startsWith('/')) {
+                      hqUrl = `https://www.elastrongroup.com${hqUrl}`;
+                  }
+                  
                   dummyHtml += `<div class="elastron-product"><img src="${hqUrl}" alt="${prod.titulo_imagem || prod.produto}" data-variant="${prod.produto}" data-high-res="${hqUrl}"></div>\n`;
               }
           });
@@ -438,8 +454,8 @@ export const fallbackManualExtraction = (html: string, pageUrl: string): Extract
   // --- GENERAL DOM EXTRACTION ---
   const highResAttrs = [
     'data-zoom', 'data-zoom-image', 'data-large', 'data-large-image', 'data-large_image', 
-    'data-native', 'data-original', 'data-high-res', 'data-src-hq',
-    'data-cloudzoom', 'data-magnify-src', 'data-image-full', 'data-main-image', 'href'
+    'data-native', 'data-original', 'data-high-res', 'data-src-hq', 'data-src', 'data-lazy-src',
+    'data-cloudzoom', 'data-magnify-src', 'data-image-full', 'data-main-image', 'href', 'data-srcset'
   ];
 
   const elements = doc.querySelectorAll('img, a');
@@ -449,23 +465,30 @@ export const fallbackManualExtraction = (html: string, pageUrl: string): Extract
     highResAttrs.forEach(attr => {
       const val = el.getAttribute(attr);
       if (val) {
-        let url = val.trim();
-        if (url.startsWith('javascript') || url.startsWith('mailto') || url.startsWith('#') || url.includes('base64')) return;
-        
-        if (url.startsWith('/')) {
-            try { url = new URL(url, pageUrl).href; } catch(e) { if(!url.startsWith('//')) return; }
-        }
-        if (url.startsWith('//')) url = 'https:' + url;
+        // Handle srcset specifically
+        const rawUrls = attr === 'data-srcset' || attr === 'srcset' 
+          ? val.split(',').map(s => s.trim().split(' ')[0]) 
+          : [val.trim()];
 
-        if (/\.(jpg|jpeg|png|webp|avif)/i.test(url)) {
-          if (attr === 'href') {
-            const hasImgChild = el.querySelector('img');
-            const classNames = (el.className || '').toLowerCase();
-            const looksLikeGallery = /(zoom|lightbox|gallery|fancybox|photo)/.test(classNames);
-            if (!hasImgChild && !looksLikeGallery) return;
+        rawUrls.forEach(rawUrl => {
+          let url = rawUrl;
+          if (url.startsWith('javascript') || url.startsWith('mailto') || url.startsWith('#') || url.includes('base64')) return;
+          
+          if (url.startsWith('/')) {
+              try { url = new URL(url, pageUrl).href; } catch(e) { if(!url.startsWith('//')) return; }
           }
-          images.push({ url, sourceType: 'gallery', confidence: 85 });
-        }
+          if (url.startsWith('//')) url = 'https:' + url;
+
+          if (/\.(jpg|jpeg|png|webp|avif)/i.test(url)) {
+            if (attr === 'href') {
+              const hasImgChild = el.querySelector('img');
+              const classNames = (el.className || '').toLowerCase();
+              const looksLikeGallery = /(zoom|lightbox|gallery|fancybox|photo)/.test(classNames);
+              if (!hasImgChild && !looksLikeGallery) return;
+            }
+            images.push({ url, sourceType: 'gallery', confidence: 85 });
+          }
+        });
       }
     });
 
@@ -527,6 +550,7 @@ export const processImages = (images: ExtractedImage[], enableQualityFilter: boo
     try {
       if (!img.url || img.url.length < 10) return;
       let url = img.url;
+      const originalUrl = img.url; // Keep track of the original thumbnail URL
       if (url.startsWith('//')) url = 'https:' + url;
       
       if (url.includes('amazon') || url.includes('m.media-amazon')) {
@@ -539,6 +563,26 @@ export const processImages = (images: ExtractedImage[], enableQualityFilter: boo
 
       if (url.includes('pugirg.it')) {
           url = url.replace('www.pugirg.it', 'tessuti.pugirg.it');
+      }
+
+      // Domedeco Specific: Often uses /cache/thumbnail/ or similar
+      if (url.includes('domedeco.com')) {
+          // Shopware 6 pattern: /thumbnail/HASH/SIZE/filename.jpg -> /HASH/filename.jpg
+          // We need to preserve the HASH segment
+          url = url.replace(/\/cache\/thumbnail\/([^\/]+)\/\d+x\d+\//i, '/$1/');
+          url = url.replace(/\/cache\/([^\/]+)\/\d+x\d+\//i, '/$1/');
+          url = url.replace(/\/thumbnail\/([^\/]+)\/\d+x\d+\//i, '/$1/');
+          
+          // Also handle common size patterns in filename
+          url = url.replace(/-\d+x\d+\.(jpg|png|webp)/i, '.$1');
+          
+          // If the URL still contains 'thumbnail', try a simpler replacement
+          if (url.includes('thumbnail')) {
+              url = url.replace(/\/thumbnail\/\d+x\d+\//i, '/');
+          }
+          
+          // Ensure we don't have double slashes
+          url = url.replace(/([^:])\/\//g, '$1/');
       }
 
       const cleanUrl = url.split('?')[0];
@@ -584,7 +628,7 @@ export const processImages = (images: ExtractedImage[], enableQualityFilter: boo
       const existingScore = existing ? getScore(existing.url, existing.confidence) : -Infinity;
 
       if (!existing || currentScore > existingScore) {
-        map.set(baseIdentity, { ...img, url });
+        map.set(baseIdentity, { ...img, url, originalUrl });
       }
     } catch (e) {
       map.set(img.url, img);
