@@ -40,23 +40,26 @@ export const analyzeProductHtml = async (html: string, url: string): Promise<Ext
   }
 
   const prompt = `You are a World-Class E-commerce Image Specialist.
-  GOAL: Identify and return only the high-resolution gallery and variant images for the product at ${url}.
+  GOAL: Identify and return only the high-resolution gallery, variant, and material/fabric swatch images for the product at ${url}.
 
   NAMING CONTEXT:
   I need to rename these files based on their variant (e.g., "Red", "Blue", "XL"). 
   If an image is specific to a variant (like a red shirt), extract "Red" as the 'variantName'.
+  If it is a fabric/material swatch for a variant, also use that variant name.
   If it is the main generic product image, leave variantName empty.
 
   EXTRACT FROM THESE CONTEXTS:
   1. JSON-LD: application/ld+json blocks often have the "image" array.
-  2. DYNAMIC GALLERIES: Look for "carousel", "slider", "swatches", "gallery".
+  2. DYNAMIC GALLERIES: Look for "carousel", "slider", "swatches", "gallery", "cms-element-image-gallery".
   3. AMAZON/MARKETPLACE: Look for hidden JSON config objects.
 
   CRITICAL RULES:
+  - INCLUDE: All gallery images showing different angles.
+  - INCLUDE: Fabric swatches or material close-ups if they are part of the product presentation.
   - STRICTLY EXCLUDE: "Customers also viewed", "Sponsored products", "Related items".
   - STRICTLY EXCLUDE: Icons, logos, badges, star ratings.
   - ONLY return images belonging to the MAIN product.
-  - 'sourceType' MUST be 'hero' for the absolute main image, 'variant' for specific color/style images, or 'gallery' for generic angles.
+  - 'sourceType' MUST be 'hero' for the absolute main image, 'variant' for specific color/style images, or 'gallery' for generic angles/swatches.
 
   Output strictly valid JSON.`;
 

@@ -51,28 +51,46 @@ export const fetchProductPage = async (url: string): Promise<string> => {
       `https://corsproxy.io/?${encodedUrl}`, 
       `https://api.allorigins.win/raw?url=${encodedUrl}`,
       `https://api.codetabs.com/v1/proxy?quest=${encodedUrl}`,
-      `https://thingproxy.freeboard.io/fetch/${targetUrl}`,
-      `https://cors-anywhere.herokuapp.com/${targetUrl}`,
-      `https://proxy.cors.sh/${targetUrl}`
+      `https://yacdn.org/proxy/${targetUrl}`
     ];
 
     for (const proxyUrl of rawProxies) {
       try {
         const proxyName = new URL(proxyUrl).hostname;
         console.log(`Trying proxy: ${proxyName}`);
-        const response = await fetchWithTimeout(proxyUrl);
+        
+        // Only add X-Requested-With for specific proxies or if we suspect it's needed
+        const headers: Record<string, string> = {};
+        if (targetUrl.includes('elastrongroup.com')) {
+            headers['X-Requested-With'] = 'XMLHttpRequest';
+        }
+        
+        const response = await fetchWithTimeout(proxyUrl, { headers });
         if (response.ok) {
           const text = await response.text();
-          if (text && text.length > 500 && !text.includes('Challenge Validation') && !text.includes('Cloudflare') && !text.includes('Access Denied')) {
+          if (text && text.length > 500 && !text.includes('Challenge Validation') && !text.includes('Cloudflare') && !text.includes('Access Denied') && !text.includes('403 Forbidden')) {
                console.log(`Success with proxy: ${proxyName}`);
                return text;
           }
           console.warn(`Proxy ${proxyName} returned invalid or blocked content (length: ${text?.length})`);
         }
+        // Small delay between proxy attempts
+        await new Promise(r => setTimeout(r, 1000));
       } catch (e) {
-        console.error(`Proxy failed:`, e);
+        // Log as warning instead of error to reduce noise, as failures are expected in a rotation
+        console.warn(`Proxy failed (${new URL(proxyUrl).hostname}):`, e instanceof Error ? e.message : e);
       }
     }
+    
+    // Final desperate attempt for Elastron or others
+    try {
+        const aoRes = await fetchWithTimeout(`https://api.allorigins.win/get?url=${encodedUrl}`);
+        if (aoRes.ok) {
+            const json = await aoRes.json();
+            if (json.contents && json.contents.length > 500) return json.contents;
+        }
+    } catch(e) {}
+    
     throw new Error("Target website is blocking the request. Try a different URL or check your connection.");
   };
 
@@ -451,6 +469,28 @@ export const fallbackManualExtraction = (html: string, pageUrl: string): Extract
     }
   }
 
+  // 6. SHOPWARE 6 (Domedeco)
+  const swGallery = doc.querySelectorAll('.cms-element-image-gallery__item, .gallery-slider-item, .gallery-slider-thumbnails-item, .product-detail-media-item, .gallery-slider-thumbnails-item-inner, .cms-gallery-slider-thumbnails-item, button[aria-label*="slide"], .gallery-slider-thumbnails-container img');
+  swGallery.forEach(item => {
+      const img = item.tagName === 'IMG' ? item : item.querySelector('img');
+      if (img) {
+          const src = img.getAttribute('data-src') || img.getAttribute('src');
+          if (src) {
+              const confidence = src.toLowerCase().includes('swatch') ? 98 : 95;
+              images.push({ url: src, sourceType: 'gallery', confidence });
+          }
+          
+          const srcset = img.getAttribute('srcset') || img.getAttribute('data-srcset');
+          if (srcset) {
+              const urls = srcset.split(',').map(s => s.trim().split(' ')[0]);
+              urls.forEach(u => {
+                  const confidence = u.toLowerCase().includes('swatch') ? 92 : 90;
+                  images.push({ url: u, sourceType: 'gallery', confidence });
+              });
+          }
+      }
+  });
+
   // --- GENERAL DOM EXTRACTION ---
   const highResAttrs = [
     'data-zoom', 'data-zoom-image', 'data-large', 'data-large-image', 'data-large_image', 
@@ -500,9 +540,10 @@ export const fallbackManualExtraction = (html: string, pageUrl: string): Extract
          for (let i = 0; i < 4 && parent; i++) {
             const pClass = (parent.getAttribute('class') || '').toLowerCase();
             const pId = (parent.getAttribute('id') || '').toLowerCase();
-            const context = pClass + ' ' + pId;
+            const pAria = (parent.getAttribute('aria-label') || '').toLowerCase();
+            const context = pClass + ' ' + pId + ' ' + pAria;
 
-            if (/(gallery|slider|slick|owl|swiper|product-image|main-image|carousel|zoom)/.test(context)) {
+            if (/(gallery|slider|slick|owl|swiper|product-image|main-image|carousel|zoom|slide)/.test(context)) {
                 isGallery = true;
                 break;
             }
@@ -512,6 +553,9 @@ export const fallbackManualExtraction = (html: string, pageUrl: string): Extract
          if (isGallery) {
              let url = src;
              if (url.startsWith('//')) url = 'https:' + url;
+             else if (url.startsWith('/')) {
+                 try { url = new URL(url, pageUrl).href; } catch(e) {}
+             }
              images.push({ url, sourceType: 'gallery', confidence: 70 });
          }
        }
@@ -567,18 +611,23 @@ export const processImages = (images: ExtractedImage[], enableQualityFilter: boo
 
       // Domedeco Specific: Often uses /cache/thumbnail/ or similar
       if (url.includes('domedeco.com')) {
-          // Shopware 6 pattern: /thumbnail/HASH/SIZE/filename.jpg -> /HASH/filename.jpg
-          // We need to preserve the HASH segment
-          url = url.replace(/\/cache\/thumbnail\/([^\/]+)\/\d+x\d+\//i, '/$1/');
-          url = url.replace(/\/cache\/([^\/]+)\/\d+x\d+\//i, '/$1/');
-          url = url.replace(/\/thumbnail\/([^\/]+)\/\d+x\d+\//i, '/$1/');
+          // Shopware 6 pattern: /thumbnail/HASH/SIZE/filename.jpg -> /media/HASH/filename.jpg
+          // We need to preserve the HASH segments (usually 3 or 4)
+          url = url.replace(/\/thumbnail\/(.+?)\/\d+x\d+\//i, '/media/$1/');
+          url = url.replace(/\/cache\/thumbnail\/(.+?)\/\d+x\d+\//i, '/media/$1/');
+          
+          // Pattern: /product/image/SIZE/filename.jpg -> /product/image/large/filename.jpg
+          // We'll try 'large' first, then 'mediumlarge' as a fallback if 'large' fails (handled by ImageCard)
+          url = url.replace(/\/product\/image\/(mediumlarge|small|medium|thumbnail|thumb)\//i, '/product/image/large/');
           
           // Also handle common size patterns in filename
           url = url.replace(/-\d+x\d+\.(jpg|png|webp)/i, '.$1');
+          url = url.replace(/_\d+x\d+\.(jpg|png|webp)/i, '.$1');
           
           // If the URL still contains 'thumbnail', try a simpler replacement
           if (url.includes('thumbnail')) {
               url = url.replace(/\/thumbnail\/\d+x\d+\//i, '/');
+              url = url.replace('thumbnail', 'media');
           }
           
           // Ensure we don't have double slashes
@@ -586,6 +635,8 @@ export const processImages = (images: ExtractedImage[], enableQualityFilter: boo
       }
 
       const cleanUrl = url.split('?')[0];
+      
+      // More aggressive normalization for baseIdentity to catch duplicates across different path structures
       let baseIdentity = cleanUrl
         .replace(/\/stencil\/[^\/]+\//i, '/stencil/normalized/')
         .replace(/\/\d+x\d+\//i, '/normalized-size/')
@@ -598,6 +649,14 @@ export const processImages = (images: ExtractedImage[], enableQualityFilter: boo
         .replace(/il_\d+xN\./i, 'il_fullxfull.')
         .replace(/\/image\/\d+\/\d+\//, '/image/original/')
         .toLowerCase();
+
+      // Domedeco/Shopware specific: strip the middle hash/size segments for better de-duplication
+      if (baseIdentity.includes('domedeco.com')) {
+          // Strip /product/image/large/ or /media/HASH/ or any variation
+          baseIdentity = baseIdentity.replace(/\/(product\/image|media|cache\/thumbnail|thumbnail|img|images)\/([^\/]+\/)*([^\/]+\.(jpg|png|webp|avif))$/i, '/$3');
+          // Also strip common Shopware suffixes from the filename itself in baseIdentity
+          baseIdentity = baseIdentity.replace(/(_\d+x\d+|_thumb|_small|_medium|_large)\.(jpg|png|webp|avif)$/i, '.$2');
+      }
 
       const existing = map.get(baseIdentity);
       
@@ -619,7 +678,7 @@ export const processImages = (images: ExtractedImage[], enableQualityFilter: boo
         if (low.includes('large') || low.includes('big')) score += 2000;
         
         if (low.includes('thumb') || low.includes('100x') || low.includes('small') || low.includes('50x50') || low.includes('compact') || low.includes('mini')) score -= 20000;
-        if (low.includes('swatch') || low.includes('icon') || low.includes('sprite') || low.includes('badge')) score -= 50000;
+        if (low.includes('icon') || low.includes('sprite') || low.includes('badge')) score -= 50000;
         
         return score + (u.length / 10);
       };
@@ -635,15 +694,53 @@ export const processImages = (images: ExtractedImage[], enableQualityFilter: boo
     }
   });
   
-  return Array.from(map.values()).filter(img => {
+  // Secondary pass: de-duplicate by filename for images on the same host
+  // This catches cases where the same image is served from different paths (e.g. /media/ vs /product/image/)
+  const finalMap = new Map<string, ExtractedImage>();
+  Array.from(map.values()).forEach(img => {
+    try {
+      const urlObj = new URL(img.url);
+      const filename = urlObj.pathname.split('/').pop()?.toLowerCase();
+      // Only de-duplicate by filename if it's specific enough (e.g. not "image.jpg" or "1.png")
+      if (filename && filename.length > 8 && /\.(jpg|jpeg|png|webp|avif)$/i.test(filename)) {
+        const normalizedHost = urlObj.hostname.replace(/^(www|webshop|media|cdn|images)\./, '');
+        const key = `${normalizedHost}:${filename}`;
+        const existing = finalMap.get(key);
+        
+        // Helper to get score for comparison
+        const getScore = (u: string, confidence: number, sourceType: string) => {
+          const low = u.toLowerCase();
+          let score = 0;
+          score += confidence * 1000;
+          if (low.includes('master') || low.includes('fullxfull') || low.includes('1600')) score += 10000;
+          if (low.includes('/media/')) score += 8000; // Prefer direct media path
+          if (low.includes('large') || low.includes('big')) score += 5000;
+          if (sourceType === 'gallery') score += 500; // Prefer gallery over hero if resolution is same
+          if (low.includes('thumb') || low.includes('small')) score -= 20000;
+          return score;
+        };
+
+        if (!existing || getScore(img.url, img.confidence, img.sourceType) > getScore(existing.url, existing.confidence, existing.sourceType)) {
+          finalMap.set(key, img);
+        }
+      } else {
+        // For generic filenames or if URL parsing fails, use the URL as key
+        finalMap.set(img.url, img);
+      }
+    } catch (e) {
+      finalMap.set(img.url, img);
+    }
+  });
+
+  return Array.from(finalMap.values()).filter(img => {
     const low = img.url.toLowerCase();
     const isUI = /logo|icon|badge|spinner|loader|placeholder|banner|footer|arrow|btn|social|app-store|play-store|promo|pixel|blank|transparent|rating|star|empty|trans\.gif/i.test(low);
     const isValidExt = /\.(jpg|jpeg|png|webp|avif)/i.test(low);
     if (isUI || !isValidExt) return false;
 
     if (enableQualityFilter) {
-       // Allow known main images even if they lack high-res markers
-       if (low.includes('base-tipo')) return true;
+       // Allow known main images or swatches even if they lack high-res markers
+       if (low.includes('base-tipo') || low.includes('swatch')) return true;
 
        if (/(32x32|50x50|100x100)/.test(low) && !low.includes('fullxfull') && !low.includes('original')) return false;
        if (img.confidence <= 60 && (low.includes('blog') || low.includes('article') || low.includes('banner'))) return false;
